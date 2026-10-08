@@ -27,7 +27,7 @@ Five microservices behind one API Gateway, split by business area (not by user r
    (users: writes)      (users: read only)                      (all on MongoDB Atlas)
 ```
 
-The arrow between Content and Learning shows the two services calling each other (see section 5).
+The arrow between Content and Learning shows the two services calling each other (see section 5). In production, an Nginx reverse proxy and load balancer sits in front of the gateway (section 10).
 
 ## 2. Design principles
 
@@ -142,6 +142,7 @@ english-online-learning-platform/
 |-- login-service/        src/, package.json, Dockerfile, .env.example, README.md
 |-- content-service/      src/, package.json, Dockerfile, .env.example, README.md
 |-- learning-service/     src/, package.json, Dockerfile, .env.example, README.md
+|-- nginx/                nginx.conf, Dockerfile (phase 2)
 |-- postman/              collection with assertions
 |-- docker-compose.yml
 |-- .env.example
@@ -164,6 +165,9 @@ Secrets live in `.env` files that are never committed to Git.
 
 ## 10. Deployment
 
+Two stages. The base project exposes the gateway directly; phase 2 puts Nginx in front of it.
+
+**Base project (first deployment)**
 ```
 Internet --> :3000 --> [ EC2 server: Docker network "elp" ]
                           gateway -> registration, login, content, learning
@@ -172,19 +176,99 @@ Internet --> :3000 --> [ EC2 server: Docker network "elp" ]
                                    MongoDB Atlas (cloud)
 ```
 
-- One Docker Compose file runs the five services; only port 3000 is published.
+**Phase 2 (production)**
+```
+Browser --HTTPS :443--> [ EC2 server: Docker network "elp" ]
+                          Nginx  (TLS, static frontend, rate limit, load balancing)
+                            |-- /       --> frontend files
+                            `-- /api/   --> API Gateway  (1..N copies)
+                                              |
+                                              v
+                                    registration, login, content, learning
+                                              |
+                                              v
+                                    MongoDB Atlas (cloud)
+```
+
+- One Docker Compose file runs the services; in the base project only port 3000 is published, in phase 2 only 80 and 443 (Nginx) are published and 3000 is closed.
 - Atlas replaces a database container. The EC2 server's IP is added to Atlas network access.
-- Security group: port 22 from the owner's IP only, port 3000 (later 443 through HTTPS) from anywhere.
+- Security group: port 22 from the owner's IP only; port 3000 for the base project, ports 80 and 443 in phase 2.
+
+### 10.1 Nginx (reverse proxy)
+
+Nginx is a web server placed in front of the application. It receives every request from the internet and passes it on, so the Node services never face the internet directly.
+
+| Job | What it does for this project |
+|---|---|
+| Reverse proxy | Forwards `/api/` to the API Gateway and hides the internal services |
+| TLS termination | Handles HTTPS with a free Let's Encrypt certificate (Certbot), so Node deals only with plain HTTP inside the network |
+| Static files | Serves the frontend (HTML, CSS, JS) at `/` efficiently |
+| Rate limiting | Limits requests per IP, for example on `/api/login` |
+| Compression and caching | gzip for responses, caching headers for static files |
+| Load balancing | Spreads requests over several copies of the gateway (10.2) |
+
+Nginx and the API Gateway do different jobs. Nginx knows about domains, HTTPS and traffic. The gateway knows the application: JWT checks, roles and which service owns which route. Keep both.
+
+Minimal configuration:
+```nginx
+upstream api_gateway {
+    least_conn;                       # send each request to the least busy copy
+    server api-gateway:3000;          # Docker DNS name; more copies are added by scaling
+}
+
+server {
+    listen 80;
+    server_name yourdomain.com;
+
+    location /api/ {
+        proxy_pass http://api_gateway;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        root /usr/share/nginx/html;   # built frontend
+        try_files $uri /index.html;
+    }
+}
+```
+Certbot then adds the HTTPS (port 443) block and the redirect from port 80.
+
+### 10.2 Load balancing
+
+A load balancer spreads incoming requests across several identical copies of a service, so no single copy is overloaded and the site keeps working if one copy fails.
+
+```
+                       +--> api-gateway (copy 1)
+Nginx (load balancer) -+--> api-gateway (copy 2)
+                       +--> api-gateway (copy 3)
+```
+
+| Algorithm | How it chooses | Use here |
+|---|---|---|
+| Round robin (Nginx default) | Takes each copy in turn | Fine for equal copies |
+| Least connections (`least_conn`) | Picks the copy with the fewest active requests | Good when request times vary |
+| IP hash (`ip_hash`) | The same client IP always reaches the same copy | Not needed, see below |
+
+- **Why this works without extra effort:** every service is stateless and the JWT carries the identity, so any copy can answer any request. No sticky sessions are required.
+- **Health:** Nginx stops sending traffic to a copy that stops answering; each service also has `/health` for external uptime checks.
+- **Scaling with Docker Compose:** `docker compose up -d --scale api-gateway=3` starts three gateway containers; Docker's internal DNS lets the service name reach all of them. The same works for `content-service` and `learning-service`, which the gateway then reaches by name.
+- **Layers:** the first load balancer is Nginx in front of the gateway. Scaling the other services relies on Docker DNS spreading calls across their copies; a dedicated internal load balancer is only worth adding at larger scale.
+- **AWS alternative:** an Application Load Balancer (ALB) can replace Nginx for balancing and HTTPS, and an Auto Scaling group can add EC2 servers automatically. It costs more, and Nginx is enough for this project.
+- **Single point of failure:** one Nginx or one EC2 server is still one failure point. Real high availability needs two or more servers behind a cloud load balancer.
 
 ## 11. Scaling notes
 
-- Services are stateless, so more copies can run behind a load balancer when needed.
+- Services are stateless, so more copies can run behind a load balancer when needed (section 10.2).
+- Nginx is the load balancer in front of the gateway; scale the busiest service first, usually the gateway and Content.
 - The database is the first real limit; Atlas can be upgraded without code changes.
 - Content and Learning are clean boundaries, so either can be split further (for example pulling progress out of Learning) if traffic demands it.
 
 ## 12. Phase 2: production hardening
 
-Done after the base backend passes all tests: HTTPS and a domain, restricting admin signup, rate limiting, stronger passwords and lockout, refresh tokens, email verification and password reset, media in object storage, Atlas backups, logs and uptime alerts, Helmet and strict CORS, automated tests and CI. The full list with reasons is in the requirements specification, section 10.
+Done after the base backend passes all tests: Nginx in front of the gateway with HTTPS and a domain (section 10), load balancing across gateway copies, restricting admin signup, rate limiting, stronger passwords and lockout, refresh tokens, email verification and password reset, media in object storage, Atlas backups, logs and uptime alerts, Helmet and strict CORS, automated tests and CI. The full list with reasons is in the requirements specification, section 10.
 
 ## 13. Known limitations
 

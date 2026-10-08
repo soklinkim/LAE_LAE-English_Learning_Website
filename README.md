@@ -52,8 +52,6 @@ A request with a valid token but the wrong role gets 403 Forbidden. A request wi
 
 The system has five services, each owning one business area and its data. Every requirement has an ID so tests can refer to it.
 
-![alt text](image.png)
-
 ### 4.1 Registration Service (port 3001)
 
 | ID | Requirement |
@@ -126,7 +124,7 @@ Owns enrollments and progress.
 | NFR-6 | Reliability | Unhandled errors return a generic 500 message with no stack trace. |
 | NFR-7 | Data | Each service owns its own database; no service writes into another's database. The Login Service only reads the users collection. |
 | NFR-8 | Data | Unique indexes prevent duplicate emails, duplicate enrollments and duplicate lesson completions. |
-| NFR-9 | Scalability | Services are stateless, so any service can run as several copies behind a load balancer. |
+| NFR-9 | Scalability | Services are stateless, so any service can run as several copies behind a load balancer; in phase 2 Nginx balances traffic across gateway copies. |
 | NFR-10 | Deployability | Each service has its own Dockerfile and starts with one command through Docker Compose. |
 | NFR-11 | Deployability | Only the gateway port is published to the host; the database is never exposed publicly. |
 | NFR-12 | Observability | Every service has a /health endpoint, and the gateway logs each request. |
@@ -191,12 +189,13 @@ All paths go through the API Gateway on port 3000. Protected routes need the hea
 | Hosting | AWS EC2 (Ubuntu) running Docker Compose |
 | API testing | Postman |
 | Version control | Git and GitHub |
+| Reverse proxy and load balancer | Nginx (phase 2), with Certbot for HTTPS |
 
 **Ports:** gateway 3000, registration 3001, login 3002, content 3003, learning 3004.
 
 **Deployment rules**
 
-- Only port 3000 (the gateway) is opened to the internet; port 22 is limited to the owner's IP.
+- Only port 3000 (the gateway) is opened to the internet in the base project, and ports 80 and 443 (Nginx) in phase 2 with port 3000 closed; port 22 is limited to the owner's IP.
 - Services reach each other over the Docker network by service name.
 - The EC2 server's IP is added to the Atlas network access list.
 - The database connection string and JWT secret are set in a .env file on the server, not in Git.
@@ -237,7 +236,7 @@ These requirements start only after section 9 passes. They are what turns a work
 
 | ID | Requirement | Why it matters |
 | --- | --- | --- |
-| HRD-1 | Serve everything over HTTPS with a domain name and a free Let's Encrypt certificate, using Nginx or a load balancer in front of the gateway. | Passwords and tokens must not travel in plain text. |
+| HRD-1 | Put Nginx in front of the gateway as a reverse proxy: serve everything over HTTPS with a domain name and a free Let's Encrypt certificate, serve the frontend from Nginx, and close port 3000 to the internet. | Passwords and tokens must not travel in plain text. |
 | HRD-2 | Only students can self-register; admin accounts are created by a seed script or an admin-only endpoint. | Today anyone can register as admin. |
 | HRD-3 | Rate-limit /api/login and /api/register per IP address. | Stops password guessing and signup spam. |
 | HRD-4 | Raise the minimum password length to 8 and lock an account briefly after repeated failed logins. | Stronger protection against guessing. |
@@ -248,6 +247,7 @@ These requirements start only after section 9 passes. They are what turns a work
 | HRD-9 | Add structured logs, uptime checks on /health, and alerts. | Problems are seen before users report them. |
 | HRD-10 | Add security headers (Helmet), restrict CORS to the real frontend domain, and add database indexes for the common queries. | Basic hardening and speed. |
 | HRD-11 | Add automated tests to the build (unit and API tests) and a CI pipeline that builds the images. | Changes stop breaking working features. |
+| HRD-12 | Run two or more copies of the gateway (and of busy services) behind Nginx with least-connections load balancing, and confirm that stopping one copy causes no downtime. | Handles more traffic and survives a failing copy. |
 
 ## 11. Build roadmap, assumptions and limitations
 
